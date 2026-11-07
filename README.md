@@ -6,6 +6,7 @@ Instituto Tecnológico de Costa Rica · Prof. M.Sc. Esteban Arias Méndez
 **Integrantes**
 - Alexandra Milagros De Gracia Calderón
 - Tamara Villarevia Navarro
+
 Sistema de memoria compartida distribuida en espacio de usuario sobre Linux, con
 paginación bajo demanda (`mmap` + `SIGSEGV`), comunicación por sockets TCP y
 coherencia mediante el protocolo MSI.
