@@ -1,0 +1,16 @@
+# Datos y resultados pesados
+*.mp4
+*.mkv
+data/
+results/
+
+# Compilación
+*.o
+*.so
+*.a
+dsm_node
+dsm_run
+dsm_query
+dsm_lab
+tools/dsm_lab
+a.out
