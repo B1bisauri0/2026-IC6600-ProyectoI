@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Compilar y verificar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compilar dsm_lab (warnings como errores)
+        run: gcc -O1 -Wall -Wextra -Werror -pthread tools/dsm_lab.c -o tools/dsm_lab
+
+      - name: Ejecutar dsm_lab
+        run: ./tools/dsm_lab
+
+      - name: Ejecutar dsm_lab con AddressSanitizer
+        run: |
+          gcc -g -O1 -fsanitize=address -pthread tools/dsm_lab.c -o tools/dsm_lab_asan
+          NOVMA=1 ./tools/dsm_lab_asan
+
+      # Se activan solos cuando existan el Makefile y las pruebas
+      - name: Compilar el proyecto
+        if: hashFiles('Makefile') != ''
+        run: make CFLAGS="-O1 -Wall -Wextra -Werror -pthread"
+
+      - name: Pruebas en una sola máquina
+        if: hashFiles('tests/run_local.sh') != ''
+        run: bash tests/run_local.sh
+
+  release:
+    name: Publicar entrega
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Crear release con los PDF del repositorio
+        uses: softprops/action-gh-release@v2
+        with:
+          files: docs/**/*.pdf
