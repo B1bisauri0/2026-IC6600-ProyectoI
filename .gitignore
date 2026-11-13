@@ -14,3 +14,8 @@ dsm_query
 dsm_lab
 tools/dsm_lab
 a.out
+
+# Pruebas del modulo A
+tests/test_cluster
+tests/test_unit_A
+tests/life_ref
