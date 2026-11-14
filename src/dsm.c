@@ -20,6 +20,7 @@
 #include "dsm_internal.h"
 #include "pager.h"
 #include "wire.h"
+#include "sync.h"
 
 dsm_node_t g_n;
 
@@ -763,8 +764,14 @@ int dsm_init_with(const dsm_config_t *cfg, int self_id, dsm_ctx_t **ctx) {
     if ((rc = dir_init())) return rc;
     if ((rc = pager_init())) return rc;
     vpn_init();
-    if ((rc = net_start(&g_n.cfg, self_id))) return rc;
+
+    /* Inicializa la red y el membership */
+    net_init(&g_n.cfg, (node_id_t)self_id);
     if ((rc = membership_start(&g_n.cfg, self_id))) return rc;
+    sync_start(&g_n.cfg, (node_id_t)self_id);
+    puente_start();
+    if (net_start() < 0) return DSM_ERR_NET; /* inicia el hilo de recepcion de mensajes */
+
     g_n.ready = 1;
     stats_init();
     node_ctx.owner_pid = (uint32_t)getpid();
