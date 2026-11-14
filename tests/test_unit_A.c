@@ -18,7 +18,7 @@
 
 #include "../include/dsm.h"
 #include "../include/dsm_types.h"
-#include "../src/config.h"
+#include "../include/config.h"
 #include "../src/dsm_internal.h"
 #include "../src/pager.h"
 #include "../src/stats.h"
