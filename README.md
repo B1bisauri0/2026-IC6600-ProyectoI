@@ -85,4 +85,4 @@ Pruebas en una sola máquina (tres nodos con puertos distintos):
 ./dsm_node --conf dsm_local.conf --id 2
 ```
  
-Puertos del proyecto: **27000–27099**. Cada nodo usa `puerto_base`, `+1` y `+2`.
+Puertos del proyecto: **27700–27799**. Cada nodo usa `puerto_base`, `+1` y `+2`.
