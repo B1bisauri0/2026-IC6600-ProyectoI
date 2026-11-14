@@ -256,8 +256,12 @@ static void *hb_main(void *a) {
     return NULL;
 }
 
-int net_start(const dsm_config_t *cfg, int self_id) {
-    (void)cfg; (void)self_id;
+/* el arranque ahora va en partes: net_init, sync_start, puente_start y net_start */
+void net_init(const dsm_config_t *cfg, node_id_t self) { (void)cfg; (void)self; }
+int  sync_start(const dsm_config_t *cfg, node_id_t self) { (void)cfg; (void)self; return 0; }
+void puente_start(void) { }
+
+int net_start(void) {
     signal(SIGPIPE, SIG_IGN);
     running = 1;
     bar_cnt = calloc(NBAR, sizeof(int)); bar_go = calloc(NBAR, sizeof(int));
