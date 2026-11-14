@@ -308,7 +308,7 @@ static void *listener_main(void *arg) {
 }
 
 /* connect() con timeout. Devuelve el fd o -1. */
-static int connect_to(const peer_t *p, int timeout_ms) {
+static int connect_to(const dsm_peer_t *p, int timeout_ms) {
     char port[8];
     snprintf(port, sizeof port, "%u", p->port_base);
     struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM }, *res;
@@ -382,7 +382,7 @@ int net_start(void) {
     pthread_t t;
     pthread_create(&t, NULL, listener_main, NULL);  pthread_detach(t);
     pthread_create(&t, NULL, connector_main, NULL); pthread_detach(t);
-    for (int i = 0; i < cfg->worker_threads; i++) {
+    for (int i = 0; i < (int)cfg->worker_threads; i++) {
         pthread_create(&t, NULL, worker_main, NULL);
         pthread_detach(t);
     }

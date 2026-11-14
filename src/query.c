@@ -33,8 +33,8 @@ static void fmt_mib(char *buf, size_t n, uint64_t bytes) {
 /* dsm_query nodes */
 static void q_nodes(FILE *out, const char *args) {
     (void)args;
-    dsm_node_status_t st[MAX_PEERS];
-    int n = membership_snapshot(st, MAX_PEERS);
+    dsm_node_status_t st[DSM_MAX_NODES];
+    int n = membership_snapshot(st, DSM_MAX_NODES);
     fprintf(out, "%-3s %-15s %-6s %-8s %-9s %-9s %-9s %s\n",
             "ID", "HOST", "PUERTO", "ESTADO", "APORTE", "USADO", "LIBRE", "ULTIMO LATIDO");
     for (int i = 0; i < n; i++) {

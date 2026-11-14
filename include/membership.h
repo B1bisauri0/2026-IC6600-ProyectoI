@@ -6,7 +6,7 @@
 #include "config.h"
 #include "dsm.h"
 
-int  membership_start(const dsm_config_t *cfg, node_id_t self);
+int  membership_start(const dsm_config_t *cfg, int self_id);
 
 /* Copia el estado de todos los nodos configurados. Devuelve cuántos copió. */
 int  membership_snapshot(dsm_node_status_t *out, int max);
