@@ -107,7 +107,7 @@ Tres nodos en una sola máquina, cada uno en su terminal:
 Consultar el estado del clúster desde otra terminal:
 
 ```bash
-./dsm_query --port 27002 nodes
+./dsm_query --port 27702 nodes
 ```
 
 En el laboratorio, con las IP reales en `dsm.conf` (idéntico en las tres
@@ -128,7 +128,7 @@ CLOCK, nodo caído y el Juego de la Vida comparado contra la versión secuencial
 
 ## Notas
 
-- Puertos del proyecto: **27000–27099**. Cada nodo usa `puerto_base`, `+1` y `+2`.
+- Puertos del proyecto: **27700–27799**. Cada nodo usa `puerto_base`, `+1` y `+2`.
 - `worker_threads=1` en los `.conf`: la parte de memoria necesita que los
   mensajes de un mismo nodo se atiendan en orden. Para el Prototipo 2 se
   cambiará a una cola por nodo de origen, que permite usar más hilos.
