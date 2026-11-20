@@ -21,6 +21,7 @@
 #include "../include/dsm.h"
 #include "../src/dsm_internal.h"
 #include "../src/pager.h"
+#include "../src/directory.h"
 #include "stub_b.h"
 
 int dsm_app_main(dsm_ctx_t *ctx, int argc, char **argv);   /* life.c */
@@ -90,6 +91,59 @@ static void t5(void) {
     fprintf(stderr, "t5 nodo %d: evictions=%lu writebacks=%lu cache=%lu\n", stub_self, (unsigned long)ev, (unsigned long)wb, (unsigned long)pager_cache_count());
     check(pager_cache_count() <= g_n.cfg.cache_max_pages + 4, "la cache no supera cache_max_pages");
     if (stub_self == 0) { check(ev > 0, "evictions > 0"); check(wb > 0, "writebacks > 0"); }
+    if (stub_self == 1) { check(ev > 0, "nodo 1 evictions > 0"); }
+}
+
+/* ---------- t7 ---------- */
+static void t7(void) {
+    /* Compara Game of Life alineado vs --no-align (sec. 11.4 y 14.1):
+     * 1. Conteo de celulas vivas y hash identicos
+     * 2. sum(transfers_no_align) > sum(transfers_aligned) debido a falso compartir */
+    uint64_t *metrics = NULL;
+    if (stub_self == 0) {
+        metrics = dsm_malloc(ctx, PS);
+        memset(metrics, 0, PS);
+        dsm_publish(ctx, "t7_metrics", metrics);
+    } else {
+        while (!(metrics = dsm_lookup(ctx, "t7_metrics"))) usleep(1000);
+    }
+    dsm_barrier(ctx, 400, stub_n);
+
+    /* 1. Ejecucion ALINEADA (64x64, 30 generaciones, random seed 7) */
+    char *argv_align[] = { (char *)"life", (char *)"64", (char *)"30", (char *)"--random", (char *)"7", (char *)"--quiet" };
+    int rc1 = dsm_app_main(ctx, 6, argv_align);
+    check(rc1 == 0, "life alineado exitoso");
+    dsm_barrier(ctx, 401, stub_n);
+
+    /* Contabilizar transferencias de paginas por la red */
+    uint64_t local_transf1 = dir_get_total_transfers();
+    dsm_lock(ctx, 2);
+    metrics[0] += local_transf1;
+    dsm_unlock(ctx, 2);
+    dir_reset_total_transfers();
+    dsm_barrier(ctx, 402, stub_n);
+
+    /* 2. Ejecucion NO ALINEADA (--no-align) */
+    char *argv_noalign[] = { (char *)"life", (char *)"64", (char *)"30", (char *)"--random", (char *)"7", (char *)"--no-align", (char *)"--quiet" };
+    int rc2 = dsm_app_main(ctx, 7, argv_noalign);
+    check(rc2 == 0, "life no-align exitoso");
+    dsm_barrier(ctx, 404, stub_n);
+
+    uint64_t local_transf2 = dir_get_total_transfers();
+    dsm_lock(ctx, 2);
+    metrics[1] += local_transf2;
+    dsm_unlock(ctx, 2);
+    dsm_barrier(ctx, 405, stub_n);
+
+    if (stub_self == 0) {
+        uint64_t t_align = metrics[0];
+        uint64_t t_noalign = metrics[1];
+        fprintf(stderr, "t7: transferencias totales aligned=%lu, no-align=%lu\n",
+                (unsigned long)t_align, (unsigned long)t_noalign);
+        check(t_noalign > t_align, "sum(transfers_no_align) > sum(transfers_align)");
+        dsm_free(ctx, metrics);
+    }
+    dsm_barrier(ctx, 406, stub_n);
 }
 
 /* ---------- clock_diff ---------- */
@@ -210,7 +264,8 @@ static void node_main(int self) {
     c.request_timeout_ms = 5000; c.heartbeat_ms = 50; c.heartbeat_miss_max = 3;
     c.cache_max_pages = getenv("CACHE") ? (uint32_t)atoi(getenv("CACHE")) : 24000;
     c.replacement_policy = getenv("POLICY") && (!strcmp(getenv("POLICY"), "clock") || !strcmp(getenv("POLICY"), "1")) ? 1 : 0;
-    c.worker_threads = 4; c.max_user_threads = 16; c.replication_factor = 1;
+    c.worker_threads = 4; c.max_user_threads = 16;
+    c.replication_factor = getenv("REPL") ? (uint32_t)atoi(getenv("REPL")) : 1;
     int rc = dsm_init_with(&c, self, &ctx);
     if (rc) { fprintf(stderr, "dsm_init fallo: %d\n", rc); _exit(10); }
     dsm_thread_register(ctx);
@@ -218,6 +273,7 @@ static void node_main(int self) {
     if (!strcmp(test_name, "t3")) t3();
     else if (!strcmp(test_name, "t4")) t4();
     else if (!strcmp(test_name, "t5")) t5();
+    else if (!strcmp(test_name, "t7")) t7();
     else if (!strcmp(test_name, "clock_diff")) clock_diff();
     else if (!strcmp(test_name, "big")) big();
     else if (!strcmp(test_name, "down")) down();
@@ -226,6 +282,8 @@ static void node_main(int self) {
         for (int i = 0; i < test_argc; i++) if (!strcmp(test_argv[i], "--solo")) solo = 1;
         if (!solo || stub_self == 0) fails += dsm_app_main(ctx, test_argc, test_argv) != 0;   /* --solo: solo lo lanza el nodo 0 */
         dsm_barrier(ctx, 999, stub_n);                  /* los demas nodos siguen vivos aportando memoria */
+        uint64_t tr = dir_get_total_transfers();
+        fprintf(stderr, "[nodo %d] transferencias_directorio=%lu\n", stub_self, (unsigned long)tr);
     }
     else { fprintf(stderr, "escenario desconocido\n"); _exit(11); }
     fflush(stdout); fflush(stderr);

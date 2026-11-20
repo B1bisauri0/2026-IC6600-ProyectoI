@@ -24,4 +24,8 @@ void dir_check_timeouts(uint64_t now_ms);
  * *more = 1 si quedan mas. Devuelve cuantas copio. */
 uint32_t dir_snapshot(vpn_t vpn_start, uint32_t max, pt_entry_t *out, int *more);
 
+/* Conteo acumulado de transferencias de paginas por la red */
+uint64_t dir_get_total_transfers(void);
+void     dir_reset_total_transfers(void);
+
 #endif

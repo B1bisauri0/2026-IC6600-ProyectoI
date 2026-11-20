@@ -6,7 +6,7 @@ INC     = -Iinclude -Isrc
 SRC  = $(wildcard src/*.c)
 OBJ  = $(SRC:.c=.o)
 
-all: dsm_node dsm_query tools/dsm_lab
+all: dsm_node dsm_query tools/dsm_lab apps/life/life.so
 
 dsm_node: $(OBJ)
 	$(CC) $(OBJ) -o $@ $(LDFLAGS)
@@ -20,11 +20,23 @@ dsm_query: tools/dsm_query.c
 tools/dsm_lab: tools/dsm_lab.c
 	$(CC) $(CFLAGS) $< -o $@
 
+apps/life/life.so: apps/life/life.c apps/life/life_common.h
+	$(CC) $(CFLAGS) -shared -fPIC $(INC) -o $@ apps/life/life.c
+
+# TODO para Integrante B:
+# dsm_run: tools/dsm_run.c
+# 	$(CC) $(CFLAGS) $(INC) $< -o $@ $(LDFLAGS)
+# apps/filestore/filestore.so: apps/filestore/filestore.c
+# 	$(CC) $(CFLAGS) -shared -fPIC $(INC) -o $@ apps/filestore/filestore.c
+
+tests: all
+	bash tests/run_local.sh
+
 asan: CFLAGS += -fsanitize=address
 asan: LDFLAGS += -fsanitize=address
 asan: clean all
 
 clean:
-	rm -f src/*.o dsm_node dsm_query tools/dsm_lab
+	rm -f src/*.o dsm_node dsm_query tools/dsm_lab apps/life/life.so
 
-.PHONY: all asan clean
+.PHONY: all asan clean tests

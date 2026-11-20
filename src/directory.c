@@ -108,6 +108,16 @@ static void reply_error(vpn_t vpn, dreq_t *r, int code, node_id_t node) {
     }
 }
 
+static _Atomic uint64_t s_cum_transfers = 0;
+
+uint64_t dir_get_total_transfers(void) {
+    return atomic_load(&s_cum_transfers);
+}
+
+void dir_reset_total_transfers(void) {
+    atomic_store(&s_cum_transfers, 0);
+}
+
 /* Entrega la pagina al solicitante. Si es el propio home, el marco ya esta en su memfd. */
 static void reply_data(vpn_t vpn, dreq_t *r, pg_state_t perm, uint32_t ver, int payload) {
     if (r->requester == SELF) {
@@ -121,13 +131,17 @@ static void reply_data(vpn_t vpn, dreq_t *r, pg_state_t perm, uint32_t ver, int 
               iov, payload ? 2 : 1);
 }
 
-/* Concede M a R: propietario = R, copias = {R}, version + 1 (sec. 4.3) */
+/* Concede M a R: propietario = R, copias = {R}, version + 1 (sec. 4.3).
+ * Incrementa transfers cada vez que la pagina cambia de dueno (sec. 5.5 y 10.6). */
 static void grant_m(vpn_t vpn, dir_entry_t *e, dreq_t *r, int had_copy) {
     node_id_t R = r->requester;
+    if (e->owner != R) {
+        if (g_n.transfers) g_n.transfers[vpn]++;
+        atomic_fetch_add(&s_cum_transfers, 1);
+    }
     e->state = PG_MODIFIED; e->owner = R; e->sharers = BIT(R);
     e->acks_pending = 0;
     e->version++;
-    g_n.transfers[vpn]++;
     int payload = (r->access == ACC_W) || !had_copy;   /* UPGRADE con copia valida: solo permiso */
     reply_data(vpn, r, PG_MODIFIED, e->version, payload);
 }
@@ -390,7 +404,7 @@ void dir_on_writeback(const msg_hdr_t *h, const uint8_t *body) {
     }
     dlock(vpn);
     dir_entry_t *e = E(vpn);
-    if (e->state == PG_MODIFIED && e->owner == h->src) {
+    if ((e->state == PG_MODIFIED && e->owner == h->src) || e->state == PG_INVALID) {
         memcpy(VPN_SYS(vpn), p, g_n.page_size);
         dreq_t *r = e->waitq_head ? &pool[e->waitq_head] : NULL;
         if ((e->busy & DIR_BUSY) && r && r->phase == PH_FETCH && r->wait_mask == BIT(h->src)) {
@@ -439,17 +453,33 @@ void dir_on_node_down(node_id_t n) {
             vpn_t vpn = rg[i].start + k;
             dlock(vpn);
             dir_entry_t *e = E(vpn);
-            if (e->state == PG_MODIFIED && e->owner == n) {               /* caso 4.4.6: la ultima version se perdio */
-                e->state = PG_INVALID; e->sharers = 0; e->busy |= DIR_LOST;
+            if (e->state == PG_MODIFIED && e->owner == n) {
+                if (g_n.cfg.replication_factor >= 2) {
+                    /* Seccion 7.1 paso 6: el home vuelve a la version de su marco (ultimo checkpoint) */
+                    e->state = PG_INVALID;
+                    e->sharers = 0;
+                    e->owner = DSM_NODE_NONE;
+                } else {
+                    /* caso 4.4.6: la ultima version se perdio */
+                    e->state = PG_INVALID; e->sharers = 0; e->busy |= DIR_LOST;
+                }
             }
             e->sharers &= (uint16_t)~BIT(n);                              /* caso 4.4.5 */
             if (e->state == PG_SHARED && !e->sharers) e->state = PG_INVALID;
             if (e->waitq_head && (e->busy & DIR_BUSY)) {
                 dreq_t *r = &pool[e->waitq_head];
                 if (r->phase == PH_FETCH && (r->wait_mask & BIT(n))) {
-                    reply_error(vpn, r, E_NODE_DOWN, n);
-                    finish(e);
-                    start_next(vpn);
+                    if (g_n.cfg.replication_factor >= 2) {
+                        /* Recupera version de marco del home */
+                        r->net_req = 0;
+                        complete_fetch(vpn, e, r, 0);
+                        finish(e);
+                        start_next(vpn);
+                    } else {
+                        reply_error(vpn, r, E_NODE_DOWN, n);
+                        finish(e);
+                        start_next(vpn);
+                    }
                 } else if (r->phase == PH_INVAL && (r->wait_mask & BIT(n))) {
                     r->wait_mask &= (uint16_t)~BIT(n);
                     e->acks_pending = (uint16_t)popcnt(r->wait_mask);

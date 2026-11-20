@@ -3,6 +3,7 @@
 *.mkv
 data/
 results/
+resultados/
 
 # Compilación
 *.o
@@ -18,4 +19,5 @@ a.out
 # Pruebas del modulo A
 tests/test_cluster
 tests/test_unit_A
+tests/test_replica
 tests/life_ref

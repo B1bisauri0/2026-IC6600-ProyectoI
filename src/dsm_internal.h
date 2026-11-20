@@ -7,6 +7,8 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdio.h>
+#include <string.h>
+#include <arpa/inet.h>
 #include "dsm_types.h"
 #include "config.h"
 #include "network.h"
@@ -40,12 +42,33 @@ extern dsm_node_t g_n;
 
 #define LOG_ERR(...) do { fprintf(stderr, "[dsm %d] ", g_n.self); fprintf(stderr, __VA_ARGS__); } while (0)
 
+#include "wire.h"
+
 /* ---- tabla de asignaciones (dsm.c) ---- */
 typedef struct { vpn_t start; uint32_t n; } vpn_range_t;
 node_id_t alloc_home_of(vpn_t vpn);                       /* DSM_NODE_NONE si no esta asignada */
 node_id_t alloc_backup_of(vpn_t vpn);
 /* rangos de paginas cuyo home es 'home'; el llamador libera *out con free() */
 int       alloc_home_ranges(node_id_t home, vpn_range_t **out);
+
+/* Funciones para consultar y actualizar tramos de asignacion (extents) */
+size_t    alloc_extent_count(void);
+int       alloc_get_extent(size_t index, vpn_t *out_start, uint32_t *out_n, node_id_t *out_home, node_id_t *out_backup);
+int       alloc_update_extent_nodes(vpn_t vstart, uint32_t n_pages, node_id_t new_home, node_id_t new_backup);
+int       online_others(node_id_t *out);
+
+/* RPC helpers sincronos compartidos (dsm.c y replica.c) */
+typedef struct rpc {
+    uint32_t alloc_id;
+    int kind;
+    uint16_t waiting;
+    uint32_t granted[DSM_MAX_NODES];
+    struct rpc *next;
+} rpc_t;
+
+rpc_t *rpc_begin(uint32_t id, int kind, uint16_t mask);
+int    rpc_wait_end(rpc_t *r);
+void   rpc_reply(uint32_t id, int kind, node_id_t from, uint32_t val);
 
 /* Funciones para consultar y recorrer la tabla de asignaciones (sec. 5.3 y 10.6) */
 size_t    dsm_alloc_count(void);

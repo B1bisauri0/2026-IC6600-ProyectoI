@@ -21,6 +21,7 @@
 #include "pager.h"
 #include "wire.h"
 #include "sync.h"
+#include "replica.h"
 
 dsm_node_t g_n;
 
@@ -266,21 +267,19 @@ static uint64_t resv_take(uint32_t id) {
 }
 
 /* ========================================================================= */
-/* RPC de ALLOC_REQUEST / ALLOC_ANNOUNCE (el hilo de usuario espera; el pool  */
-/* solo completa la cuenta)                                                  */
+/* RPC de ALLOC_REQUEST / ALLOC_ANNOUNCE / REPLICA                           */
 /* ========================================================================= */
-typedef struct rpc { uint32_t alloc_id; int kind; uint16_t waiting; uint32_t granted[DSM_MAX_NODES]; struct rpc *next; } rpc_t;
 static rpc_t *rpcs;
 static pthread_mutex_t rpc_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t rpc_cv = PTHREAD_COND_INITIALIZER;
 
-static rpc_t *rpc_begin(uint32_t id, int kind, uint16_t mask) {
+rpc_t *rpc_begin(uint32_t id, int kind, uint16_t mask) {
     rpc_t *r = calloc(1, sizeof *r);
     r->alloc_id = id; r->kind = kind; r->waiting = mask;
     pthread_mutex_lock(&rpc_mu); r->next = rpcs; rpcs = r; pthread_mutex_unlock(&rpc_mu);
     return r;
 }
-static int rpc_wait_end(rpc_t *r) {
+int rpc_wait_end(rpc_t *r) {
     uint64_t end = now_ms() + g_n.cfg.request_timeout_ms;
     int rc = 0;
     pthread_mutex_lock(&rpc_mu);
@@ -297,7 +296,7 @@ static int rpc_wait_end(rpc_t *r) {
     pthread_mutex_unlock(&rpc_mu);
     return rc;
 }
-static void rpc_reply(uint32_t id, int kind, node_id_t src, uint32_t granted) {
+void rpc_reply(uint32_t id, int kind, node_id_t src, uint32_t granted) {
     pthread_mutex_lock(&rpc_mu);
     for (rpc_t *r = rpcs; r; r = r->next)
         if (r->alloc_id == id && r->kind == kind && (r->waiting & BIT(src))) {
@@ -455,7 +454,7 @@ static void apply_free(uint32_t id) {
 /* ========================================================================= */
 /* dsm_malloc / dsm_malloc_striped                                           */
 /* ========================================================================= */
-static int online_others(node_id_t *ids) {
+int online_others(node_id_t *ids) {
     node_id_t on[DSM_MAX_NODES];
     int n = membership_online_ids(on, DSM_MAX_NODES), k = 0;
     for (int i = 0; i < n; i++) if (on[i] != (node_id_t)g_n.self) ids[k++] = on[i];
@@ -495,16 +494,6 @@ static void abort_alloc(uint32_t alloc_id, uint64_t local, const uint32_t *got, 
         net_sendv((node_id_t)n, MSG_FREE, 0, net_new_req_id(), &iov, 1);   /* libera su reserva */
     }
     vpn_free(v0, np);
-}
-
-static node_id_t select_backup_node(node_id_t home) {
-    if (g_n.cfg.replication_factor < 2) return DSM_NODE_NONE;
-    int n_nodes = g_n.cfg.max_nodes ? (int)g_n.cfg.max_nodes : DSM_MAX_NODES;
-    for (int step = 1; step < n_nodes; step++) {
-        node_id_t cand = (node_id_t)((home + step) % n_nodes);
-        if (membership_status(cand) == NODE_ONLINE) return cand;
-    }
-    return DSM_NODE_NONE;
 }
 
 static _Atomic uint32_t alloc_ctr;
@@ -814,198 +803,59 @@ void dsm_task_notify_failure(int err, node_id_t err_node, vpn_t vpn) {
     atomic_store(&g_task_failed_err, err);
 }
 
+size_t alloc_extent_count(void) {
+    pthread_rwlock_rdlock(&alloc_rw);
+    size_t cnt = n_xs;
+    pthread_rwlock_unlock(&alloc_rw);
+    return cnt;
+}
+
+int alloc_get_extent(size_t index, vpn_t *out_start, uint32_t *out_n, node_id_t *out_home, node_id_t *out_backup) {
+    pthread_rwlock_rdlock(&alloc_rw);
+    if (index >= n_xs) {
+        pthread_rwlock_unlock(&alloc_rw);
+        return -1;
+    }
+    if (out_start) *out_start = xs[index].start;
+    if (out_n) *out_n = xs[index].n;
+    if (out_home) *out_home = xs[index].home;
+    if (out_backup) *out_backup = xs[index].backup;
+    pthread_rwlock_unlock(&alloc_rw);
+    return 0;
+}
+
+int alloc_update_extent_nodes(vpn_t vstart, uint32_t n_pages, node_id_t new_home, node_id_t new_backup) {
+    pthread_rwlock_wrlock(&alloc_rw);
+    for (size_t i = 0; i < n_xs; i++) {
+        if (xs[i].start >= vstart && xs[i].start < vstart + n_pages) {
+            xs[i].home = new_home;
+            xs[i].backup = new_backup;
+            if (xs[i].rec) {
+                for (int k = 0; k < xs[i].rec->a.n_extents; k++) {
+                    if (xs[i].rec->a.extents[k].vpn_start == xs[i].start) {
+                        xs[i].rec->a.extents[k].home = new_home;
+                        xs[i].rec->a.extents[k].backup = new_backup;
+                    }
+                }
+            }
+        }
+    }
+    pthread_rwlock_unlock(&alloc_rw);
+    return 0;
+}
+
 void dsm_on_node_down(node_id_t id) {
     if (!g_n.ready) return;
     dir_on_node_down(id);
     pager_on_node_down(id);
-
-    /* Factor 2: recuperacion de tramos cuyo home era id (sec. 7.1) */
-    if (g_n.cfg.replication_factor >= 2) {
-        pthread_rwlock_wrlock(&alloc_rw);
-        for (size_t i = 0; i < n_xs; i++) {
-            if (xs[i].home == id && xs[i].backup == (node_id_t)g_n.self) {
-                node_id_t new_home = (node_id_t)g_n.self;
-                node_id_t new_backup = select_backup_node(new_home);
-                vpn_t vstart = xs[i].start;
-                uint32_t np = xs[i].n;
-
-                /* 1. Actualizar asignacion local */
-                xs[i].home = new_home;
-                xs[i].backup = new_backup;
-                if (xs[i].rec) {
-                    for (int k = 0; k < xs[i].rec->a.n_extents; k++) {
-                        if (xs[i].rec->a.extents[k].vpn_start == xs[i].start) {
-                            xs[i].rec->a.extents[k].home = new_home;
-                            xs[i].rec->a.extents[k].backup = new_backup;
-                        }
-                    }
-                }
-
-                /* 2. Reconstruir directorio local como nuevo home (Sec. 7.1 paso 9) */
-                for (uint32_t pg = 0; pg < np; pg++) {
-                    vpn_t v = vstart + pg;
-                    g_n.dir[v].state = PG_SHARED;
-                    g_n.dir[v].owner = DSM_NODE_NONE;
-                    g_n.dir[v].sharers = 0;
-                    g_n.dir[v].version = 1;
-                    pager_page_lock(v);
-                    g_n.lp[v].flags |= PF_ISHOME;
-                    g_n.lp[v].flags &= (uint8_t)~PF_CACHED;
-                    g_n.lp[v].state = PG_SHARED;
-                    size_t off = (size_t)v << g_n.page_shift;
-                    mprotect(g_n.app + off, g_n.page_size, PROT_READ);
-                    pager_page_unlock(v);
-                }
-
-                /* 3. Difundir HOME_CHANGE y esperar HOME_CHANGE_ACK */
-                uint8_t b[14], *p = b;
-                w32(&p, vstart); w32(&p, np); w16(&p, id); w16(&p, new_home); w16(&p, new_backup);
-                struct iovec iov = { b, 14 };
-                node_id_t oth[DSM_MAX_NODES];
-                int no = online_others(oth);
-                uint16_t mask = 0;
-                for (int k = 0; k < no; k++) mask |= BIT(oth[k]);
-
-                int hc_ok = 1;
-                if (mask) {
-                    rpc_t *r = rpc_begin(vstart, 4, mask);
-                    for (int k = 0; k < no; k++) {
-                        net_sendv(oth[k], MSG_HOME_CHANGE, 0, net_new_req_id(), &iov, 1);
-                    }
-                    if (rpc_wait_end(r) < 0) {
-                        LOG_ERR("recuperacion incompleta: timeout en HOME_CHANGE_ACK para tramo %u\n", vstart);
-                        hc_ok = 0;
-                    }
-                    free(r);
-                }
-                if (!hc_ok) continue; /* No emitir RECOVER_DONE si no confirmaron */
-
-                /* 4. Replicar al nuevo backup y esperar REPLICA_ACK */
-                int repl_ok = 1;
-                if (new_backup != DSM_NODE_NONE && membership_status(new_backup) == NODE_ONLINE) {
-                    for (uint32_t pg = 0; pg < np; pg++) {
-                        vpn_t v = vstart + pg;
-                        size_t off = (size_t)v << g_n.page_shift;
-                        uint8_t hd[8], *q = hd;
-                        w32(&q, v); w32(&q, 1);
-                        struct iovec r_iov[2] = { { hd, 8 }, { g_n.sys + off, g_n.page_size } };
-                        rpc_t *rr = rpc_begin(v, 3, BIT(new_backup));
-                        if (net_sendv(new_backup, MSG_REPLICA_UPDATE, MSG_F_PAYLOAD, net_new_req_id(), r_iov, 2) >= 0) {
-                            if (rpc_wait_end(rr) < 0 || rr->granted[new_backup] != 1) repl_ok = 0;
-                        } else repl_ok = 0;
-                        free(rr);
-                        if (!repl_ok) break;
-                    }
-                }
-                if (!repl_ok) {
-                    LOG_ERR("recuperacion incompleta: fallo replicacion al nuevo backup %u\n", new_backup);
-                    continue; /* No emitir RECOVER_DONE */
-                }
-
-                /* 5. Difundir RECOVER_DONE tras completar la recuperacion real */
-                uint8_t rdb[6], *rdp = rdb;
-                w16(&rdp, id); w32(&rdp, 1);
-                struct iovec rdiov = { rdb, 6 };
-                for (int k = 0; k < no; k++) {
-                    net_sendv(oth[k], MSG_RECOVER_DONE, 0, net_new_req_id(), &rdiov, 1);
-                }
-                STAT_INC(recoveries);
-            }
-        }
-        pthread_rwlock_unlock(&alloc_rw);
-    }
+    replica_on_node_down(id);
 }
 
 /* ========================================================================= */
 /* Consultas del sistema (sec. 10.6) y dsm_checkpoint (sec. 10.3 / 14.4)     */
 /* ========================================================================= */
 int dsm_checkpoint(dsm_ctx_t *ctx) {
-    (void)ctx;
-    if (!g_n.ready) return DSM_ERR_NOT_INIT;
-
-    uint64_t n_replicated = 0;
-    int checkpoint_failed = 0;
-
-    /* Estructura para registrar paginas modificadas a confirmar */
-    vpn_t mod_vpns[1024];
-    uint32_t mod_vers[1024];
-    node_id_t mod_bks[1024];
-    int n_mods = 0;
-
-    for (vpn_t v = 0; v < (vpn_t)g_n.n_vpages && n_mods < 1024; v++) {
-        pager_page_lock(v);
-        local_page_t *lp = &g_n.lp[v];
-        if (lp->state == PG_MODIFIED) {
-            mod_vpns[n_mods] = v;
-            mod_vers[n_mods] = lp->version;
-            node_id_t bk = DSM_NODE_NONE;
-            if (lp->flags & PF_ISHOME) {
-                if (g_n.cfg.replication_factor >= 2) {
-                    bk = alloc_backup_of(v);
-                }
-            } else {
-                bk = alloc_home_of(v);
-            }
-            mod_bks[n_mods] = bk;
-            n_mods++;
-        }
-        pager_page_unlock(v);
-    }
-
-    /* Enviar actualizaciones y esperar confirmaciones (con timeout y validacion de version) */
-    for (int i = 0; i < n_mods; i++) {
-        vpn_t v = mod_vpns[i];
-        node_id_t dst = mod_bks[i];
-        uint32_t expected_ver = mod_vers[i];
-        size_t off = (size_t)v << g_n.page_shift;
-
-        if (dst != DSM_NODE_NONE && membership_status(dst) == NODE_ONLINE) {
-            uint8_t hd[8], *q = hd;
-            w32(&q, v); w32(&q, expected_ver);
-            struct iovec iov[2] = { { hd, 8 }, { g_n.sys + off, g_n.page_size } };
-
-            rpc_t *r = rpc_begin(v, 3, BIT(dst));
-            int send_rc = net_sendv(dst, MSG_REPLICA_UPDATE, MSG_F_PAYLOAD, net_new_req_id(), iov, 2);
-            if (send_rc >= 0) {
-                int wait_rc = rpc_wait_end(r);
-                if (wait_rc < 0 || r->granted[dst] != expected_ver) {
-                    checkpoint_failed = 1;
-                } else {
-                    n_replicated++;
-                }
-            } else {
-                checkpoint_failed = 1;
-            }
-            free(r);
-        } else if (g_n.cfg.replication_factor >= 2) {
-            /* Factor 2 activo pero no hay backup disponible u online para esta pagina */
-            checkpoint_failed = 1;
-        }
-
-        if (checkpoint_failed) break;
-    }
-
-    if (checkpoint_failed) {
-        /* Fallo parcial o timeout: NO marcar paginas como limpias ni degradar a PROT_READ */
-        return DSM_ERR_NET;
-    }
-
-    /* Solo tras confirmacion de todas las replicas requeridas, degradar a PROT_READ para atrapar escrituras */
-    for (int i = 0; i < n_mods; i++) {
-        vpn_t v = mod_vpns[i];
-        pager_page_lock(v);
-        local_page_t *lp = &g_n.lp[v];
-        if (lp->state == PG_MODIFIED) {
-            size_t off = (size_t)v << g_n.page_shift;
-            mprotect(g_n.app + off, g_n.page_size, PROT_READ);
-            lp->flags &= (uint8_t)~PF_DIRTY;
-        }
-        pager_page_unlock(v);
-    }
-
-    STAT_INC(checkpoints);
-    STAT_ADD(replica_pages_sent, n_replicated);
-    return DSM_OK;
+    return replica_checkpoint(ctx);
 }
 
 int dsm_dump_allocs(dsm_ctx_t *ctx, FILE *out) {
@@ -1183,72 +1033,11 @@ void dsm_msg_dispatch(const msg_hdr_t *h, const uint8_t *body) {
     case MSG_FREE:           apply_free(r32(&p)); break;
 
     /* Extra de tolerancia a fallos con replica (sec. 7.1 y 14.4) */
-    case MSG_REPLICA_UPDATE: {
-        if (h->length >= 8 + g_n.page_size) {
-            uint32_t vpn = r32(&p);
-            uint32_t ver = r32(&p);
-            size_t off = (size_t)vpn << g_n.page_shift;
-            memcpy(g_n.sys + off, p, g_n.page_size);
-            uint8_t b[8], *q = b; w32(&q, vpn); w32(&q, ver);
-            struct iovec iov = { b, 8 };
-            net_sendv(h->src, MSG_REPLICA_ACK, MSG_F_RESP, h->req_id, &iov, 1);
-        }
-        break;
-    }
-    case MSG_REPLICA_ACK: {
-        if (h->length >= 8) {
-            uint32_t vpn = r32(&p);
-            uint32_t ver = r32(&p);
-            rpc_reply(vpn, 3, h->src, ver);
-        }
-        break;
-    }
-    case MSG_HOME_CHANGE: {
-        if (h->length >= 14) {
-            vpn_t vstart = r32(&p);
-            uint32_t np = r32(&p);
-            (void)r16(&p);
-            node_id_t new_h = r16(&p);
-            node_id_t new_bk = r16(&p);
-            pthread_rwlock_wrlock(&alloc_rw);
-            for (size_t i = 0; i < n_xs; i++) {
-                if (xs[i].start >= vstart && xs[i].start < vstart + np) {
-                    xs[i].home = new_h; xs[i].backup = new_bk;
-                    if (xs[i].rec) {
-                        for (int k = 0; k < xs[i].rec->a.n_extents; k++) {
-                            if (xs[i].rec->a.extents[k].vpn_start == xs[i].start) {
-                                xs[i].rec->a.extents[k].home = new_h;
-                                xs[i].rec->a.extents[k].backup = new_bk;
-                            }
-                        }
-                    }
-                }
-            }
-            pthread_rwlock_unlock(&alloc_rw);
-            for (uint32_t i = 0; i < np; i++) {
-                vpn_t v = vstart + i;
-                pager_page_lock(v);
-                if ((g_n.lp[v].flags & PF_CACHED) && g_n.lp[v].state == PG_SHARED) {
-                    mprotect(g_n.app + ((size_t)v << g_n.page_shift), g_n.page_size, PROT_NONE);
-                    g_n.lp[v].state = PG_INVALID;
-                    g_n.lp[v].flags &= (uint8_t)~(PF_CACHED | PF_REF);
-                }
-                pager_page_unlock(v);
-            }
-            uint8_t b[4], *q = b; w32(&q, vstart);
-            struct iovec iov = { b, 4 };
-            net_sendv(h->src, MSG_HOME_CHANGE_ACK, MSG_F_RESP, h->req_id, &iov, 1);
-        }
-        break;
-    }
-    case MSG_HOME_CHANGE_ACK: {
-        if (h->length >= 4) {
-            uint32_t vstart = r32(&p);
-            rpc_reply(vstart, 4, h->src, 0);
-        }
-        break;
-    }
-    case MSG_RECOVER_DONE: break;
+    case MSG_REPLICA_UPDATE:     replica_handle_update(h, body); break;
+    case MSG_REPLICA_ACK:        replica_handle_ack(h, body); break;
+    case MSG_HOME_CHANGE:        replica_handle_home_change(h, body); break;
+    case MSG_HOME_CHANGE_ACK:    replica_handle_home_change_ack(h, body); break;
+    case MSG_RECOVER_DONE:       replica_handle_recover_done(h, body); break;
 
     default: break;
     }
