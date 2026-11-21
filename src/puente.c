@@ -7,6 +7,8 @@
  */
 #define _GNU_SOURCE
 #include "network.h"
+#include "query.h"
+#include "task.h"
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -57,4 +59,8 @@ void puente_start(void) {
     };
     for (size_t i = 0; i < sizeof tipos; i++)
         net_register_handler(tipos[i], a_memoria);
+    
+    /* los de la parte de red que también tienen que estar antes de net_start */
+    query_registrar_red();
+    task_registrar();
 }

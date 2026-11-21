@@ -17,6 +17,7 @@
 #include "sync.h"
 #include "network.h"
 #include "dsm.h"
+#include "task.h"
 
 #include <stdarg.h>
 #include <arpa/inet.h>
@@ -300,9 +301,10 @@ int dsm_lock(dsm_ctx_t *ctx, int lock_id)   { (void)ctx; return sync_lock(lock_i
 int dsm_unlock(dsm_ctx_t *ctx, int lock_id) { (void)ctx; return sync_unlock(lock_id); }
 int dsm_barrier(dsm_ctx_t *ctx, int id, int n) { (void)ctx; return sync_barrier(id, n); }
 
-/* printf con el número de nodo adelante, para saber quién imprimió */
+/* printf con el número de nodo adelante, para saber quién imprimió.
+Sale en la terminal del nodo y, si la app la lanzó dsm_run, también en la
+terminal de dsm_run (task.c) */
 int dsm_printf(dsm_ctx_t *ctx, const char *fmt, ...) {
-    (void)ctx;
     char buf[1024];
     va_list ap;
     va_start(ap, fmt);
@@ -310,5 +312,8 @@ int dsm_printf(dsm_ctx_t *ctx, const char *fmt, ...) {
     va_end(ap);
     int r = printf("[nodo %u] %s", self_id, buf);
     fflush(stdout);
+    char linea[1100];
+    snprintf(linea, sizeof linea, "[nodo %u] %s", self_id, buf);
+    task_escribir(ctx, linea);
     return r;
 }

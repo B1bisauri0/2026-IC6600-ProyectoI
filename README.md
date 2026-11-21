@@ -17,19 +17,24 @@ coherencia mediante el protocolo MSI.
 |---|---|---|---|
 | Documento de diseño | 6 nov | `v0.1-diseno` | Entregado |
 | Prototipo 1 | 13 nov | `v0.2-prototipo1` | Entregado |
-| Prototipo 2 | 20 nov | `v0.3-prototipo2` | Pendiente |
+| Prototipo 2 | 20 nov | `v0.3-prototipo2` | Entregado |
 | Final | 27 nov | `v1.0-final` | Pendiente |
 
 **Prototipo 1:** memoria (paginación, MSI, directorio, reemplazo FIFO/CLOCK),
 red (conexiones TCP, membresía, heartbeat), locks, barreras, consultas y
 Juego de la Vida en 1 a 3 nodos.
 
+**Prototipo 2:** ejecución distribuida (`dsm_run --all`), consultas de
+páginas, asignaciones y estadísticas de todo el sistema (`dsm_query pages`,
+`allocs`, `stats`), cola por nodo de origen en la red y réplicas con puntos
+de control.
+
 ## Estructura del repositorio
 
 ```
 .
 ├── README.md
-├── Makefile                  # compila dsm_node, dsm_query y dsm_lab
+├── Makefile                  # compila dsm_node, dsm_query, dsm_run, dsm_lab y life.so
 ├── dsm.conf                  # configuración para las 3 computadoras del laboratorio
 ├── dsm_local.conf            # configuración para pruebas en una sola máquina
 ├── .gitignore
@@ -41,12 +46,15 @@ Juego de la Vida en 1 a 3 nodos.
 │   ├── dsm_internal.h        # estado interno compartido de la parte de memoria
 │   ├── pager.c/.h            # manejador de SIGSEGV, hilo Pager, transiciones MSI
 │   ├── directory.c/.h        # directorio de páginas del nodo home
+│   ├── replica.c/.h          # réplicas, puntos de control y recuperación
 │   ├── stats.c/.h            # estadísticas
 │   ├── wire.h                # serialización de los cuerpos de mensaje
 │   ├── network.c             # sockets, conexiones, lectores y pool de servicio
 │   ├── puente.c              # une la parte de memoria con la red
+│   ├── espera.c/.h           # preguntar algo a otro nodo y esperar la respuesta
 │   ├── membership.c          # unión de nodos, tabla de nodos, heartbeat
 │   ├── sync.c                # barreras y locks distribuidos
+│   ├── task.c/.h             # carga de aplicaciones (dlopen) y ejecución distribuida
 │   └── query.c               # servidor de consultas (puerto_base + 2)
 │
 ├── include/
@@ -60,7 +68,8 @@ Juego de la Vida en 1 a 3 nodos.
 │   └── query.h
 │
 ├── tools/
-│   ├── dsm_query.c           # consulta el estado de los nodos
+│   ├── dsm_run.c             # lanza una aplicación en el nodo local o en todos
+│   ├── dsm_query.c           # consulta nodos, páginas, asignaciones y estadísticas
 │   └── dsm_lab.c             # verificación de la computadora antes de usar el DSM
 │
 ├── apps/
@@ -73,17 +82,18 @@ Juego de la Vida en 1 a 3 nodos.
 │   └── run_local.sh          # corre todas las pruebas en una sola máquina
 │
 └── docs/
-    └── entregable1/          # documento de diseño (PDF)
+    ├── entregable1/          # documento de diseño (PDF)
+    └── entregable2/          # documento del Prototipo 1 (PDF)
 ```
 
-**Pendiente para el Prototipo 2:** `task.c` y `dsm_run` (ejecución distribuida
-de aplicaciones), `replica.c` (réplicas y puntos de control), `apps/filestore/`
-(almacén de archivos grandes) y consultas de páginas y estadísticas.
+**Pendiente para el Final:** `apps/filestore/` (almacén de archivos grandes),
+heartbeat por su propio puerto (`puerto_base + 1`), pruebas en el laboratorio,
+informe y manual de usuario.
 
 ## Compilación
 
 ```bash
-make            # compila dsm_node, dsm_query y tools/dsm_lab
+make            # compila dsm_node, dsm_query, dsm_run, tools/dsm_lab y apps/life/life.so
 make clean      # borra lo compilado
 make asan       # compila con AddressSanitizer
 ```
@@ -99,16 +109,13 @@ Verificar la computadora:
 Tres nodos en una sola máquina, cada uno en su terminal:
 
 ```bash
-./dsm_node --conf dsm_local.conf --id 0 --demo-lock 2 --demo-barrier 2
-./dsm_node --conf dsm_local.conf --id 1 --demo-lock 2 --demo-barrier 2
-./dsm_node --conf dsm_local.conf --id 2 --demo-lock 2 --demo-barrier 2
+./dsm_node --conf dsm_local.conf --id 0
+./dsm_node --conf dsm_local.conf --id 1
+./dsm_node --conf dsm_local.conf --id 2
 ```
 
-Consultar el estado del clúster desde otra terminal:
-
-```bash
-./dsm_query --port 27702 nodes
-```
+Para probar solo locks y barreras, sin aplicación, se puede agregar
+`--demo-lock 2 --demo-barrier 2` a cada nodo.
 
 En el laboratorio, con las IP reales en `dsm.conf` (idéntico en las tres
 computadoras), el id se detecta solo:
@@ -117,6 +124,41 @@ computadoras), el id se detecta solo:
 ./dsm_node --conf dsm.conf
 ```
 
+### Correr una aplicación
+
+Con los nodos ya arrancados. `dsm_node` tiene que correr desde la carpeta del
+repositorio en cada computadora, para que todos encuentren la `.so` y los
+patrones:
+
+```bash
+./dsm_run apps/life/life.so 512 50 --threads 2            # solo en este nodo
+./dsm_run --all apps/life/life.so 2000 100 --threads 4    # en todos los nodos
+./dsm_run --all apps/life/life.so 300 50 --rle apps/life/patterns/gosper_gun.rle
+```
+
+Lo que la aplicación imprime con `dsm_printf` sale en la terminal de `dsm_run`.
+Para comprobar el resultado, el `grid_hash` debe ser igual al de la versión
+secuencial:
+
+```bash
+tests/life_ref 300 50 --rle apps/life/patterns/gosper_gun.rle | tail -1
+```
+
+### Consultas
+
+Desde la misma computadora que el nodo:
+
+```bash
+./dsm_query nodes        # estado y memoria de cada nodo
+./dsm_query pages        # tabla de páginas de todo el sistema
+./dsm_query pages 1      # solo las páginas cuyo home es el nodo 1
+./dsm_query allocs       # asignaciones y orden de sus páginas
+./dsm_query stats        # estadísticas por nodo y total
+```
+
+En pruebas locales, cada nodo tiene su puerto de consultas (puerto base + 2):
+`--port 27002`, `--port 27012` o `--port 27022`.
+
 ## Pruebas
 
 ```bash
@@ -124,11 +166,12 @@ bash tests/run_local.sh
 ```
 
 Incluye coherencia MSI con 2 y 3 nodos, asignaciones grandes, reemplazo FIFO y
-CLOCK, nodo caído y el Juego de la Vida comparado contra la versión secuencial.
+CLOCK, nodo caído, réplicas con recuperación y el Juego de la Vida comparado
+contra la versión secuencial.
 
 ## Notas
 
-- Puertos del proyecto: **27700–27799**. Cada nodo usa `puerto_base`, `+1` y `+2`.
-- `worker_threads=1` en los `.conf`: la parte de memoria necesita que los
-  mensajes de un mismo nodo se atiendan en orden. Para el Prototipo 2 se
-  cambiará a una cola por nodo de origen, que permite usar más hilos.
+- Puertos del proyecto: **27000–27099**. Cada nodo usa `puerto_base`, `+1` y `+2`.
+- La red tiene una cola por nodo de origen: los mensajes de un mismo nodo se
+  atienden en orden y de uno en uno (lo que necesita la parte de memoria), y
+  los de nodos distintos en paralelo. Por eso `worker_threads` puede ser mayor que 1.

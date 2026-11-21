@@ -13,4 +13,7 @@ int  query_start(const dsm_config_t *cfg, node_id_t self);
 /* Para que otras partes agreguen consultas, por ejemplo "pages" desde pager.c */
 void query_register(const char *name, query_fn_t fn);
 
+/* Handlers de red de STATS_* y PAGETABLE_* (los llama puente_start) */
+void query_registrar_red(void);
+
 #endif

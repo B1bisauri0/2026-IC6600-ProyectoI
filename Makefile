@@ -6,7 +6,7 @@ INC     = -Iinclude -Isrc
 SRC  = $(wildcard src/*.c)
 OBJ  = $(SRC:.c=.o)
 
-all: dsm_node dsm_query tools/dsm_lab apps/life/life.so
+all: dsm_node dsm_query dsm_run tools/dsm_lab apps/life/life.so
 
 dsm_node: $(OBJ)
 	$(CC) $(OBJ) -o $@ $(LDFLAGS)
@@ -23,11 +23,10 @@ tools/dsm_lab: tools/dsm_lab.c
 apps/life/life.so: apps/life/life.c apps/life/life_common.h
 	$(CC) $(CFLAGS) -shared -fPIC $(INC) -o $@ apps/life/life.c
 
-# TODO para Integrante B:
-# dsm_run: tools/dsm_run.c
-# 	$(CC) $(CFLAGS) $(INC) $< -o $@ $(LDFLAGS)
-# apps/filestore/filestore.so: apps/filestore/filestore.c
-# 	$(CC) $(CFLAGS) -shared -fPIC $(INC) -o $@ apps/filestore/filestore.c
+dsm_run: tools/dsm_run.c
+	$(CC) $(CFLAGS) $< -o $@
+
+# TODO para el Final (Tamara)
 
 tests: all
 	bash tests/run_local.sh

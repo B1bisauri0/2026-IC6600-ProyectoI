@@ -10,9 +10,14 @@
  *    pone en una cola. Los hilos del pool de servicio los sacan y llaman al
  *    handler registrado para ese tipo. Así un lector nunca se bloquea procesando
  *    (regla 4 de la estrategia anti-deadlock).
+ *  - Hay una cola POR NODO DE ORIGEN: los mensajes de un mismo nodo se atienden
+ *    en orden y de uno en uno (regla R1 de la parte de memoria), pero mensajes
+ *    de nodos distintos sí se atienden en paralelo. Por eso worker_threads puede
+ *    ser mayor que 1 sin desordenar nada.
  */
 #define _GNU_SOURCE
 #include "network.h"
+#include "stats.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -52,8 +57,11 @@ static net_conn_cb_t      conn_cb;
 static volatile int       running;
 static int                listen_fd = -1;
 
-/* cola de mensajes recibidos (lectores -> pool) */
-static work_t          *q_head, *q_tail;
+/* colas de mensajes recibidos (lectores -> pool), una por nodo de origen.
+ * ocupado[i] = 1 mientras un trabajador atiende un mensaje de i */
+typedef struct { work_t *head, *tail; int ocupado; } cola_t;
+static cola_t           colas[MAX_PEERS];
+static int              siguiente;      /* para repartir parejo entre orígenes */
 static pthread_mutex_t  q_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t   q_cond = PTHREAD_COND_INITIALIZER;
 
@@ -141,6 +149,7 @@ static int send_msg(node_id_t dst, uint8_t type, uint16_t flags, req_id_t req_id
         (page_len == 0 || send_all(fd, page, page_len) == 0))
         rc = 0;
     pthread_mutex_unlock(&c->send_lock);
+    if (rc == 0) { STAT_INC(msgs_sent); STAT_ADD(bytes_sent, sizeof h + len + page_len); }
     return rc;
 }
 
@@ -161,22 +170,37 @@ static void enqueue(const msg_hdr_t *h, void *body) {
     w->hdr = *h;
     w->body = body;
     w->next = NULL;
+    STAT_INC(msgs_recv);
+    STAT_ADD(bytes_recv, sizeof *h + h->length);
+    cola_t *c = &colas[h->src];
     pthread_mutex_lock(&q_lock);
-    if (q_tail) q_tail->next = w; else q_head = w;
-    q_tail = w;
-    pthread_cond_signal(&q_cond);
+    if (c->tail) c->tail->next = w; else c->head = w;
+    c->tail = w;
+    if (!c->ocupado) pthread_cond_signal(&q_cond);
     pthread_mutex_unlock(&q_lock);
+}
+
+/* busca un origen con mensajes que nadie esté atendiendo. Llamar con q_lock */
+static int origen_listo(void) {
+    for (int k = 0; k < MAX_PEERS; k++) {
+        int i = (siguiente + k) % MAX_PEERS;
+        if (colas[i].head && !colas[i].ocupado) { siguiente = (i + 1) % MAX_PEERS; return i; }
+    }
+    return -1;
 }
 
 static void *worker_main(void *arg) {
     (void)arg;
     for (;;) {
         pthread_mutex_lock(&q_lock);
-        while (!q_head && running) pthread_cond_wait(&q_cond, &q_lock);
-        if (!q_head) { pthread_mutex_unlock(&q_lock); break; }
-        work_t *w = q_head;
-        q_head = w->next;
-        if (!q_head) q_tail = NULL;
+        int o;
+        while ((o = origen_listo()) < 0 && running) pthread_cond_wait(&q_cond, &q_lock);
+        if (o < 0) { pthread_mutex_unlock(&q_lock); break; }
+        cola_t *c = &colas[o];
+        work_t *w = c->head;
+        c->head = w->next;
+        if (!c->head) c->tail = NULL;
+        c->ocupado = 1;                  /* nadie más toca mensajes de este nodo */
         pthread_mutex_unlock(&q_lock);
 
         msg_handler_t fn = handlers[w->hdr.type];
@@ -184,6 +208,11 @@ static void *worker_main(void *arg) {
         else fprintf(stderr, "net: mensaje tipo %u de nodo %u sin handler\n", w->hdr.type, w->hdr.src);
         free(w->body);
         free(w);
+
+        pthread_mutex_lock(&q_lock);
+        c->ocupado = 0;
+        if (c->head) pthread_cond_signal(&q_cond);   /* le toca al siguiente de ese nodo */
+        pthread_mutex_unlock(&q_lock);
     }
     return NULL;
 }
@@ -256,7 +285,8 @@ static void *reader_main(void *arg) {
             /* primer mensaje de una conexión aceptada: debe ser el saludo */
             if (h.type != MSG_JOIN_REQUEST || h.src >= cfg->n_peers || h.src == self_id ||
                 h.length < sizeof(body_hello_t)) {
-                fprintf(stderr, "net: conexión sin saludo válido, la cierro\n");
+                fprintf(stderr, "net: conexión sin saludo válido (tipo %u, dice ser nodo %u, yo soy %u), la cierro\n",
+                        h.type, h.src, self_id);
                 free(body);
                 close(a.fd);
                 return NULL;
@@ -279,6 +309,7 @@ static void *reader_main(void *arg) {
             conn_set((node_id_t)peer, a.fd);
             if (conn_cb) conn_cb((node_id_t)peer, 1);
         }
+        h.src = (uint16_t)peer;          /* por esta conexión solo habla ese nodo */
         enqueue(&h, body);
     }
     if (peer >= 0) conn_drop((node_id_t)peer, a.fd);
